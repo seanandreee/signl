@@ -1,0 +1,3 @@
+[2026-05-16T21:16:32+00:00] BLOCKED ticker=KXBTC-25DEC contracts=101 price=45c | reason: contracts 101 exceeds max 100
+[2026-05-16T21:16:32+00:00] BLOCKED ticker=KXBTC-25DEC contracts=50 price=90c | reason: trade cost 4500c (45.0% of balance) exceeds 5% cap (500c)
+[2026-05-16T21:16:32+00:00] BLOCKED ticker=KXBTC-25DEC contracts=1 price=50c | reason: trade cost 50c (125.0% of balance) exceeds 5% cap (2c)

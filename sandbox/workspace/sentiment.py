@@ -50,9 +50,12 @@ LLM_TIMEOUT = 60
 SYSTEM_PROMPT = (
     "You are a quantitative analyst evaluating Kalshi prediction markets. "
     "You will be given a market title, ticker, the current YES limit price "
-    "in cents (1-99, where each cent = 1% implied probability), and a list "
-    "of recent news headlines. Estimate the true probability that the market "
-    "resolves YES, and recommend an action.\n\n"
+    "in cents (1-99, where each cent = 1% implied probability), the market "
+    "resolution deadline, and a list of recent news headlines. Estimate the "
+    "true probability that the market resolves YES, and recommend an action.\n\n"
+    "Weight news recency relative to the time horizon: headlines from the "
+    "last 24 hours matter most for markets resolving within days; older "
+    "headlines may be more relevant for longer-horizon markets.\n\n"
     "You MUST respond with a single valid JSON object and NOTHING ELSE. "
     "No prose, no markdown fences, no preamble. The schema is:\n"
     '{\n'

@@ -1,22 +1,21 @@
-# OpenShell policy preset for the signl Kalshi trading bot.
+# OpenShell policy for the signl Kalshi trading bot — secured by NemoClaw.
 #
 # Apply with:
-#     openshell policy set ~/kalshi-signl/policies/kalshi.yaml
+#   openshell policy set --policy ~/kalshi-signl/policies/kalshi.yaml trader
 #
-# Allows python3 to reach exactly the endpoints signl needs:
-#   * Kalshi REST    - trading.kalshi.com, demo-api.kalshi.co (/trade-api/v2/**)
-#   * Nemotron       - integrate.api.nvidia.com  (POST chat/completions)
-#   * Brave Search   - api.search.brave.com      (news + web search)
-#   * Telegram bridge - api.telegram.org          (/bot*/**)
+# Network: only the five whitelisted hosts below are reachable; everything
+# else is denied by OpenShell's default-deny stance.
 #
-# Filesystem: read-write inside the workspace and a couple of cache dirs;
-# everything else is read-only or default-denied by OpenShell.
+# Filesystem: read-write only inside ~/kalshi-signl/sandbox/.
+# Sensitive paths (~/.ssh, ~/.aws, ~/.gnupg) are never granted read_only
+# or read_write access, so landlock blocks them automatically.
+#
+# Process: python3 only — binary-scoped per network policy block.
+#
+# Max position size: 100 contracts / order, 5 % of balance / trade.
+# Enforced in code by sandbox/workspace/guardrails.py.
 
 version: 1
-
-preset:
-  name: kalshi
-  description: "signl Kalshi trading bot - Kalshi + Nemotron + Brave + Telegram"
 
 filesystem_policy:
   include_workdir: true
@@ -24,14 +23,15 @@ filesystem_policy:
     - /usr
     - /lib
     - /proc
-    - /etc
     - /dev/urandom
+    - /app
+    - /etc
     - /var/log
   read_write:
+    - /home/ubuntu/kalshi-signl/sandbox/
     - /tmp
     - /dev/null
     - /sandbox/.openclaw
-    - /sandbox/.openclaw/skills/kalshi-trader
     - /sandbox/.nemoclaw
 
 landlock:
@@ -43,7 +43,7 @@ process:
 
 network_policies:
 
-  # ── Kalshi REST API (demo + production hostnames) ────────────────────
+  # ── Kalshi REST API (demo + production) ──────────────────────────────────
   kalshi:
     name: kalshi
     endpoints:
@@ -67,7 +67,7 @@ network_policies:
       - { path: /usr/bin/python3 }
       - { path: /usr/local/bin/python3 }
 
-  # ── NVIDIA Nemotron (OpenAI-compatible) ──────────────────────────────
+  # ── NVIDIA Nemotron (OpenAI-compatible inference) ────────────────────────
   nvidia_inference:
     name: nvidia_inference
     endpoints:
@@ -84,7 +84,7 @@ network_policies:
       - { path: /usr/bin/python3 }
       - { path: /usr/local/bin/python3 }
 
-  # ── Brave Search (news + web fallback for sentiment.search_news) ─────
+  # ── Brave Search (news + web for sentiment pipeline) ─────────────────────
   brave_search:
     name: brave_search
     endpoints:
@@ -99,7 +99,7 @@ network_policies:
       - { path: /usr/bin/python3 }
       - { path: /usr/local/bin/python3 }
 
-  # ── Telegram (OpenClaw bridge runs in node; python3 may also push) ───
+  # ── Telegram (trade alerts and blocked-order notifications) ──────────────
   telegram:
     name: telegram
     endpoints:
@@ -112,10 +112,5 @@ network_policies:
           - allow: { method: POST, path: "/bot*/**" }
           - allow: { method: GET,  path: "/file/bot*/**" }
     binaries:
-      - { path: /usr/local/bin/node }
-      - { path: /usr/bin/node }
       - { path: /usr/bin/python3 }
       - { path: /usr/local/bin/python3 }
-
-# Everything else (DNS over HTTPS, package mirrors, GitHub, etc.) is denied
-# by OpenShell's default-deny stance for any binary not listed above.
