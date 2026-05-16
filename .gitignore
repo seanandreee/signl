@@ -1,0 +1,6 @@
+.claude.json
+.claude/
+.claude.json
+.claude/
+*.db
+.env
