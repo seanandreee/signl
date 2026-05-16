@@ -15,11 +15,11 @@ preset:
   description: "signl - Kalshi prediction market bot (Brave + Nemotron + Telegram)"
 
 network_policies:
-  # ── Kalshi trading API (demo + production) ────────────────────────────
+  # ── Kalshi trading API (demo + production, current + legacy hostnames) ─
   kalshi:
     name: kalshi
     endpoints:
-      - host: demo-api.kalshi.co
+      - host: demo-api.kalshi.co                 # demo (legacy alias)
         port: 443
         protocol: rest
         enforcement: enforce
@@ -27,7 +27,23 @@ network_policies:
           - allow: { method: GET,    path: "/trade-api/v2/**" }
           - allow: { method: POST,   path: "/trade-api/v2/**" }
           - allow: { method: DELETE, path: "/trade-api/v2/**" }
-      - host: trading.kalshi.com
+      - host: external-api.demo.kalshi.co        # demo (canonical)
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow: { method: GET,    path: "/trade-api/v2/**" }
+          - allow: { method: POST,   path: "/trade-api/v2/**" }
+          - allow: { method: DELETE, path: "/trade-api/v2/**" }
+      - host: api.elections.kalshi.com           # prod (current canonical)
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow: { method: GET,    path: "/trade-api/v2/**" }
+          - allow: { method: POST,   path: "/trade-api/v2/**" }
+          - allow: { method: DELETE, path: "/trade-api/v2/**" }
+      - host: external-api.kalshi.com            # prod (legacy alias)
         port: 443
         protocol: rest
         enforcement: enforce

@@ -28,7 +28,17 @@ import json
 import logging
 import re
 import sys
+from pathlib import Path
 from typing import Any, Callable
+
+# Load ~/kalshi-signl/.env into the process env BEFORE importing modules
+# that read os.environ at import time (kalshi_client, sentiment).
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(Path(__file__).resolve().parents[2] / ".env", override=False)
+except ImportError:  # python-dotenv not installed yet; env must be exported
+    pass
 
 import db
 import kalshi_client

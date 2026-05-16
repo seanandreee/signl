@@ -57,7 +57,7 @@ def _load_private_key() -> rsa.RSAPrivateKey:
 
     Cached so we don't re-parse PEM on every request.
     """
-    path = os.environ.get("KALSHI_PRIVATE_KEY_PATH")
+    path = "/home/ubuntu/kalshi-signl/kalshi-key.pem"
     if not path:
         raise KalshiError("KALSHI_PRIVATE_KEY_PATH not set")
     try:
@@ -75,14 +75,19 @@ def _load_private_key() -> rsa.RSAPrivateKey:
 
 
 def _signature(method: str, path: str, timestamp_ms: str) -> str:
-    """Return the base64 RSA-PSS signature for the given request."""
+    """Return the base64 RSA-PSS signature for the given request.
+
+    Kalshi's reference implementation uses ``salt_length = DIGEST_LENGTH``
+    (32 bytes for SHA-256). PSS verification at Kalshi accepts any valid
+    salt length, but we mirror the reference to avoid surprises.
+    """
     key = _load_private_key()
     message = f"{timestamp_ms}{method.upper()}{path}".encode("utf-8")
     signed = key.sign(
         message,
         padding.PSS(
             mgf=padding.MGF1(hashes.SHA256()),
-            salt_length=padding.PSS.MAX_LENGTH,
+            salt_length=padding.PSS.DIGEST_LENGTH,
         ),
         hashes.SHA256(),
     )
@@ -96,7 +101,7 @@ def sign_request(method: str, path: str) -> dict[str, str]:
     ``/trade-api/v2/markets/AAPL-2026``), not just the suffix relative
     to ``BASE_URL``.
     """
-    key_id = os.environ.get("KALSHI_KEY_ID")
+    key_id ="df7da51f-3152-4b39-9c22-fcc8cdd7063e"
     if not key_id:
         raise KalshiError("KALSHI_KEY_ID not set")
     ts = str(int(time.time() * 1000))
