@@ -1,6 +1,7 @@
 .claude.json
 .claude/
-.claude.json
-.claude/
 *.db
 .env
+*.pem
+__pycache__/
+*.pyc

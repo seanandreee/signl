@@ -1,0 +1,92 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# NemoClaw OpenShell preset for the signl Kalshi trading bot.
+# Apply with:
+#   nemoclaw <sandbox> policy-add --from-file ./policies/kalshi.yaml --yes
+#
+# Network access is intentionally narrow:
+#   - python3 may reach Kalshi (demo + prod), Nemotron, and Brave Search.
+#   - node may reach Telegram (OpenClaw owns Telegram I/O; Python must not
+#     call api.telegram.org directly).
+# Filesystem: only the bot's workspace is writable.
+
+preset:
+  name: kalshi-signl
+  description: "signl - Kalshi prediction market bot (Brave + Nemotron + Telegram)"
+
+network_policies:
+  # ── Kalshi trading API (demo + production) ────────────────────────────
+  kalshi:
+    name: kalshi
+    endpoints:
+      - host: demo-api.kalshi.co
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow: { method: GET,    path: "/trade-api/v2/**" }
+          - allow: { method: POST,   path: "/trade-api/v2/**" }
+          - allow: { method: DELETE, path: "/trade-api/v2/**" }
+      - host: trading.kalshi.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow: { method: GET,    path: "/trade-api/v2/**" }
+          - allow: { method: POST,   path: "/trade-api/v2/**" }
+          - allow: { method: DELETE, path: "/trade-api/v2/**" }
+    binaries:
+      - { path: /usr/bin/python3 }
+
+  # ── NVIDIA Nemotron via the OpenAI-compatible endpoint ────────────────
+  nvidia_nemotron:
+    name: nvidia_nemotron
+    endpoints:
+      - host: integrate.api.nvidia.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow: { method: POST, path: "/v1/chat/completions" }
+          - allow: { method: GET,  path: "/v1/models" }
+          - allow: { method: GET,  path: "/v1/models/**" }
+    binaries:
+      - { path: /usr/bin/python3 }
+
+  # ── Brave Search (news headlines for sentiment.py) ────────────────────
+  brave_search:
+    name: brave_search
+    endpoints:
+      - host: api.search.brave.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow: { method: GET, path: "/res/v1/web/search" }
+    binaries:
+      - { path: /usr/bin/python3 }
+
+  # ── Telegram Bot API (node-only; OpenClaw delivers the messages) ──────
+  telegram_bot:
+    name: telegram_bot
+    endpoints:
+      - host: api.telegram.org
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow: { method: GET,  path: "/bot*/**" }
+          - allow: { method: POST, path: "/bot*/**" }
+          - allow: { method: GET,  path: "/file/bot*/**" }
+    binaries:
+      - { path: /usr/local/bin/node }
+      - { path: /usr/bin/node }
+
+# ── Filesystem: only the bot's workspace is writable (SQLite lives here) ──
+filesystem_policy:
+  include_workdir: false
+  read_only:
+    - /home/ubuntu/kalshi-signl
+  read_write:
+    - /home/ubuntu/kalshi-signl/sandbox/workspace
+    - /tmp
