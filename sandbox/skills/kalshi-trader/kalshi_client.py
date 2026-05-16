@@ -281,17 +281,39 @@ def get_market(ticker: str) -> Dict[str, Any]:
         return {"ok": False, "error": f"get_market failed: {exc}"}
 
 
-def get_markets_by_keyword(keyword: str, limit: int = 50) -> Dict[str, Any]:
-    """Search open markets and return those whose title/ticker contain
-    ``keyword`` (case-insensitive).
+def _paginate_markets(
+    params: Dict[str, Any],
+    max_pages: int = 5,
+) -> List[Dict[str, Any]]:
+    """Fetch all pages of /markets up to ``max_pages`` (default 5 = up to 5 000
+    markets at page_size=1000).  Returns the raw market dicts."""
+    collected: List[Dict[str, Any]] = []
+    cursor: Optional[str] = None
+    for _ in range(max_pages):
+        p = {**params, "limit": 1000}
+        if cursor:
+            p["cursor"] = cursor
+        body = _request("GET", "/markets", params=p)
+        page = body.get("markets") or []
+        collected.extend(page)
+        cursor = body.get("cursor") or ""
+        if not cursor:
+            break
+    return collected
+
+
+def get_markets_by_keyword(keyword: str, max_pages: int = 5) -> Dict[str, Any]:
+    """Search all open markets and return those whose title/ticker/subtitle
+    contain ``keyword`` (case-insensitive).
+
+    Paginates through up to ``max_pages`` pages of results (1 000 per page)
+    so the keyword filter runs across the full market catalogue.
     """
     try:
         kw = keyword.strip().lower()
-        body = _request(
-            "GET", "/markets",
-            params={"status": "open", "limit": int(limit)},
+        all_markets = _paginate_markets(
+            {"status": "open"}, max_pages=max_pages
         )
-        all_markets = body.get("markets") or []
         matches = [
             _normalise_market(m) for m in all_markets
             if kw in (m.get("title") or "").lower()
@@ -305,14 +327,16 @@ def get_markets_by_keyword(keyword: str, limit: int = 50) -> Dict[str, Any]:
         return {"ok": False, "error": f"get_markets_by_keyword failed: {exc}"}
 
 
-def get_all_open_markets(limit: int = 200) -> Dict[str, Any]:
-    """Return open markets sorted by descending 24h volume."""
+def get_all_open_markets(max_pages: int = 5) -> Dict[str, Any]:
+    """Return all open markets sorted by descending 24h volume.
+
+    Paginates through up to ``max_pages`` pages (1 000 markets per page).
+    """
     try:
-        body = _request(
-            "GET", "/markets",
-            params={"status": "open", "limit": int(limit)},
+        all_markets = _paginate_markets(
+            {"status": "open"}, max_pages=max_pages
         )
-        markets = [_normalise_market(m) for m in (body.get("markets") or [])]
+        markets = [_normalise_market(m) for m in all_markets]
         markets.sort(key=lambda m: (m.get("volume") or 0), reverse=True)
         return {"ok": True, "data": markets}
     except KalshiError as exc:

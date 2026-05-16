@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -50,9 +51,12 @@ LLM_TIMEOUT = 60
 SYSTEM_PROMPT = (
     "You are a quantitative analyst evaluating Kalshi prediction markets. "
     "You will be given a market title, ticker, the current YES limit price "
-    "in cents (1-99, where each cent = 1% implied probability), and a list "
-    "of recent news headlines. Estimate the true probability that the market "
-    "resolves YES, and recommend an action.\n\n"
+    "in cents (1-99, where each cent = 1% implied probability), the market "
+    "resolution deadline, and a list of recent news headlines. Estimate the "
+    "true probability that the market resolves YES, and recommend an action.\n\n"
+    "Weight news recency relative to the time horizon: headlines from the "
+    "last 24 hours matter most for markets resolving within days; older "
+    "headlines may be more relevant for longer-horizon markets.\n\n"
     "You MUST respond with a single valid JSON object and NOTHING ELSE. "
     "No prose, no markdown fences, no preamble. The schema is:\n"
     '{\n'
@@ -207,13 +211,74 @@ def _call_nemotron(messages: List[Dict[str, str]]) -> str:
     return resp.choices[0].message.content or ""
 
 
+_AGE_PATTERNS = [
+    (re.compile(r"(\d+)\s+hour", re.I), "hours"),
+    (re.compile(r"(\d+)\s+day", re.I), "days"),
+    (re.compile(r"(\d+)\s+week", re.I), "weeks"),
+    (re.compile(r"(\d+)\s+month", re.I), "months"),
+]
+
+
+def _headline_age_hours(age_str: str) -> Optional[float]:
+    """Parse a Brave 'age' string like '2 hours ago' into hours.  Returns None
+    if unparseable."""
+    s = (age_str or "").strip()
+    for pattern, unit in _AGE_PATTERNS:
+        m = pattern.search(s)
+        if m:
+            n = int(m.group(1))
+            if unit == "hours":
+                return float(n)
+            if unit == "days":
+                return float(n * 24)
+            if unit == "weeks":
+                return float(n * 24 * 7)
+            if unit == "months":
+                return float(n * 24 * 30)
+    return None
+
+
+def _filter_headlines(
+    headlines: List[Dict[str, Any]],
+    close_time: Optional[str],
+) -> List[Dict[str, Any]]:
+    """Drop headlines that are too stale relative to the market horizon.
+
+    Markets resolving within 7 days: drop anything older than 48 hours.
+    Markets resolving beyond 7 days (or unknown horizon): drop anything older
+    than 7 days.
+    """
+    now = datetime.now(timezone.utc)
+    if close_time:
+        try:
+            ct = datetime.fromisoformat(close_time.replace("Z", "+00:00"))
+            horizon_days = (ct - now).total_seconds() / 86400
+        except Exception:
+            horizon_days = 30.0
+    else:
+        horizon_days = 30.0
+
+    max_age_hours = 48.0 if horizon_days <= 7 else 168.0
+
+    filtered = []
+    for h in headlines:
+        age_h = _headline_age_hours(h.get("age", ""))
+        if age_h is None or age_h <= max_age_hours:
+            filtered.append(h)
+    return filtered
+
+
 def analyze_sentiment(
     market_title: str,
     market_ticker: str,
     yes_price_cents: int,
     headlines: List[Dict[str, Any]],
+    close_time: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Send context to Nemotron and return a validated analysis dict.
+
+    ``close_time`` is an ISO-8601 string of when the market resolves; it is
+    injected into the prompt so the model can weight recency appropriately.
 
     Returns ``{"ok": True, "data": {probability, confidence, key_factors,
     recommended_action, reasoning}}`` on success.
@@ -226,18 +291,25 @@ def analyze_sentiment(
         except (TypeError, ValueError):
             return {"ok": False, "error": "yes_price_cents must be int"}
 
+        fresh = _filter_headlines(headlines or [], close_time)
+
         headlines_block = "\n".join(
             f"- {h.get('title', '')} | {h.get('source', '')} | {h.get('age', '')}"
             f"\n    {h.get('description', '')[:240]}"
-            for h in (headlines or [])[:10]
+            for h in fresh[:10]
         ) or "(no recent headlines found)"
+
+        close_line = (
+            f"Market resolves: {close_time}\n" if close_time else ""
+        )
 
         user = (
             f"Market title: {market_title}\n"
             f"Ticker: {market_ticker}\n"
             f"Current YES price: {yes_price}c "
-            f"(implied probability {yes_price}%)\n\n"
-            f"Recent headlines:\n{headlines_block}\n\n"
+            f"(implied probability {yes_price}%)\n"
+            f"{close_line}"
+            f"\nRecent headlines:\n{headlines_block}\n\n"
             "Respond with the JSON object only."
         )
         messages = [
@@ -293,13 +365,21 @@ def get_full_analysis(ticker: str) -> Dict[str, Any]:
         title = market.get("title") or ticker
         yes_ask = market.get("yes_ask")
         yes_bid = market.get("yes_bid")
-        yes_price = yes_ask or yes_bid or 50
+        if yes_ask and yes_bid:
+            yes_price = int(round((yes_bid + yes_ask) / 2))
+        elif yes_ask or yes_bid:
+            yes_price = yes_ask or yes_bid
+        else:
+            return {"ok": False,
+                    "error": "market has no YES bid or ask price — cannot analyse"}
+        close_time: Optional[str] = market.get("close_time")
 
         n = search_news(title)
         headlines = n.get("data", []) if n.get("ok") else []
         news_error = None if n.get("ok") else n.get("error")
 
-        a = analyze_sentiment(title, ticker, int(yes_price), headlines)
+        a = analyze_sentiment(title, ticker, int(yes_price), headlines,
+                              close_time=close_time)
         if not a.get("ok"):
             return {
                 "ok": False,

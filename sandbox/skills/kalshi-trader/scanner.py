@@ -18,6 +18,7 @@ except Exception:  # pragma: no cover
     pass
 
 import db
+import guardrails
 import kalshi_client
 import risk
 import sentiment
@@ -28,8 +29,17 @@ ALERT_PREFIX = "[ALERT]"
 
 
 def _yes_price(market: Dict[str, Any]) -> Optional[int]:
-    """Best mid-ish YES price from a Kalshi market snapshot."""
-    for key in ("yes_ask", "last_price", "yes_bid"):
+    """Mid-point YES price from a Kalshi market snapshot.
+
+    Uses (yes_bid + yes_ask) / 2 when both sides are available for an
+    accurate edge calculation.  Falls back to last_price, then whichever
+    side is present, rather than defaulting to the ask alone.
+    """
+    bid = market.get("yes_bid")
+    ask = market.get("yes_ask")
+    if isinstance(bid, (int, float)) and isinstance(ask, (int, float)) and bid > 0 and ask > 0:
+        return int(round((bid + ask) / 2))
+    for key in ("last_price", "yes_ask", "yes_bid"):
         v = market.get(key)
         if isinstance(v, (int, float)) and v > 0:
             return int(v)
@@ -70,8 +80,12 @@ def _format_alert(ticker: str, alert: Dict[str, Any], price: int) -> str:
     )
 
 
-def run_auto_trade(ticker: str) -> str:
-    """Full auto-trade pipeline.  Always returns a Telegram-ready string."""
+def run_auto_trade(ticker: str, balance_cents: Optional[int] = None) -> str:
+    """Full auto-trade pipeline.  Always returns a Telegram-ready string.
+
+    Pass ``balance_cents`` to reuse a balance already fetched by the caller
+    (e.g. ``scan_all``); when omitted the function fetches it itself.
+    """
     ticker = ticker.strip().upper()
     snap = check_market(ticker)
     if not snap.get("ok"):
@@ -92,25 +106,46 @@ def run_auto_trade(ticker: str) -> str:
     yes_price = data["yes_price_cents"]
     prob = int(analysis["probability"])
     title = market.get("title") or ticker
+    confidence = analysis["confidence"]
+
+    e = risk.edge(prob, yes_price)
+    trade_side = "yes" if e > 0 else "no"
+
+    existing = db.get_position(ticker).get("data")
+    if existing and existing.get("side") == trade_side:
+        out = (
+            f"{AUTO_PREFIX} {ticker} SKIP (already holding "
+            f"{existing['num_contracts']} {existing['side'].upper()})\n"
+            f"  Title: {title}\n"
+            f"  YES price: {yes_price}c | Model P(YES): {prob}% | "
+            f"edge: {e:+.2f} | conf: {confidence}"
+        )
+        return "\n".join([out] + alert_lines).strip()
 
     if not risk.should_trade(prob, yes_price, min_edge=0.05):
         out = (
             f"{AUTO_PREFIX} {ticker} HOLD\n"
             f"  Title: {title}\n"
             f"  YES price: {yes_price}c | Model P(YES): {prob}% | "
-            f"edge: {risk.edge(prob, yes_price):+.2f}\n"
-            f"  Confidence: {analysis['confidence']}\n"
+            f"edge: {e:+.2f}\n"
+            f"  Confidence: {confidence}\n"
             f"  Reasoning: {analysis['reasoning']}"
         )
         return "\n".join([out] + alert_lines).strip()
 
-    bal = kalshi_client.get_balance()
-    if not bal.get("ok"):
-        return (f"{AUTO_PREFIX} {ticker} aborted: balance lookup failed: "
-                f"{bal.get('error')}")
-    balance_cents = int(bal["balance_cents"])
+    if balance_cents is None:
+        bal = kalshi_client.get_balance()
+        if not bal.get("ok"):
+            return (f"{AUTO_PREFIX} {ticker} aborted: balance lookup failed: "
+                    f"{bal.get('error')}")
+        balance_cents = int(bal["balance_cents"])
 
-    summary = risk.trade_summary(prob, yes_price, balance_cents)
+    yes_bid = market.get("yes_bid")
+    summary = risk.trade_summary(
+        prob, yes_price, balance_cents,
+        confidence=confidence,
+        yes_bid_cents=int(yes_bid) if isinstance(yes_bid, (int, float)) and yes_bid > 0 else None,
+    )
     side = summary["side"]
     contracts = int(summary["contracts"])
     sizing_price = int(summary["sizing_price_cents"])
@@ -119,6 +154,19 @@ def run_auto_trade(ticker: str) -> str:
         return (f"{AUTO_PREFIX} {ticker} skipped: position sizing returned 0 "
                 f"(balance ${balance_cents/100:.2f}, edge "
                 f"{summary['edge']:+.2f})")
+
+    allowed, block_reason = guardrails.check_order(
+        ticker, contracts=contracts,
+        price_cents=sizing_price, balance_cents=balance_cents,
+    )
+    if not allowed:
+        block_msg = (
+            f"{AUTO_PREFIX} {ticker} ORDER BLOCKED by NemoClaw guardrails: "
+            f"{block_reason}\n"
+            f"  Wanted: {contracts} {side.upper()} @ {sizing_price}c | "
+            f"Model P(YES): {prob}% | edge: {summary['edge']:+.2f}"
+        )
+        return "\n".join([block_msg] + alert_lines).strip()
 
     order = kalshi_client.place_order(
         ticker, side=side, action="buy",
@@ -220,17 +268,28 @@ def run_manual_update(ticker: str) -> str:
 def scan_all() -> List[str]:
     """Iterate the watchlist and dispatch per mode.  Returns one message
     per market (auto markets emit ``[AUTO-TRADE]``; manual markets emit
-    ``[MANUAL]``)."""
+    ``[MANUAL]``).
+
+    Balance is fetched once for the entire scan cycle so that multiple
+    auto-trades in a single pass don't each see the pre-trade balance.
+    """
     out: List[str] = []
     wl = db.get_watchlist()
     if not wl.get("ok"):
         return [f"scan_all: {wl.get('error')}"]
+
+    shared_balance_cents: Optional[int] = None
+    bal = kalshi_client.get_balance()
+    if bal.get("ok"):
+        shared_balance_cents = int(bal["balance_cents"])
+
     for row in wl["data"]:
         ticker = row["ticker"]
         mode = row["mode"]
         try:
             if mode == "auto":
-                out.append(run_auto_trade(ticker))
+                out.append(run_auto_trade(ticker,
+                                          balance_cents=shared_balance_cents))
             else:
                 out.append(run_manual_update(ticker))
         except Exception as exc:

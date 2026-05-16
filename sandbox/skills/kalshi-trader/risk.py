@@ -17,7 +17,18 @@ Conventions
 from __future__ import annotations
 
 from math import floor
-from typing import Dict
+from typing import Dict, Optional
+
+_CONFIDENCE_KELLY: Dict[str, float] = {
+    "high": 0.25,
+    "medium": 0.15,
+    "low": 0.08,
+}
+
+
+def _confidence_kelly_fraction(confidence: str) -> float:
+    """Map an LLM confidence label to a Kelly scaling fraction."""
+    return _CONFIDENCE_KELLY.get(str(confidence).strip().lower(), 0.15)
 
 
 def _as_fractions(probability: float, yes_price_cents: float) -> tuple[float, float]:
@@ -64,12 +75,14 @@ def calculate_position_size(
     yes_price_cents: float,
     balance_cents: int,
     max_position_pct: float = 0.05,
+    kelly_fraction: float = 0.25,
 ) -> int:
     """Return the integer number of contracts to buy.
 
     Sizing rule, in order:
 
-    1. Use fractional Kelly (1/4) to compute a target dollar stake.
+    1. Use fractional Kelly (``kelly_fraction``, default 0.25) to compute a
+       target dollar stake.
     2. Cap stake at ``max_position_pct`` of the bankroll (default 5%).
     3. Convert to contracts at ``yes_price_cents``.
     4. Clamp to ``[1, 100]``.
@@ -83,7 +96,7 @@ def calculate_position_size(
     if balance <= 0 or price <= 0 or price >= 100:
         return 0
 
-    f = fractional_kelly(probability, price, fraction=0.25)
+    f = fractional_kelly(probability, price, fraction=kelly_fraction)
     cap = max(0.0, float(max_position_pct))
     stake_fraction = min(f, cap)
     if stake_fraction <= 0.0:
@@ -124,14 +137,35 @@ def trade_summary(
     *,
     min_edge: float = 0.05,
     max_position_pct: float = 0.05,
+    yes_bid_cents: Optional[int] = None,
+    confidence: str = "medium",
 ) -> Dict[str, object]:
-    """Bundle every sizing decision into one dict for callers and logs."""
+    """Bundle every sizing decision into one dict for callers and logs.
+
+    ``yes_bid_cents`` is used to derive the correct NO ask price
+    (``no_ask = 100 - yes_bid``) when trading the NO side.  When absent,
+    falls back to ``100 - yes_price_cents`` as a conservative estimate.
+
+    ``confidence`` scales the Kelly fraction: high=0.25, medium=0.15, low=0.08.
+    """
     e = edge(probability, yes_price_cents)
     side = "yes" if e > 0 else "no"
-    sizing_price = yes_price_cents if side == "yes" else (100 - int(yes_price_cents))
-    sizing_prob = probability if side == "yes" else (100 - float(probability))
+
+    if side == "yes":
+        sizing_price = int(yes_price_cents)
+        sizing_prob = float(probability)
+    else:
+        # NO ask = 100 - yes_bid; use yes_bid when available for accuracy.
+        no_ask = 100 - int(yes_bid_cents if yes_bid_cents is not None
+                           else yes_price_cents)
+        sizing_price = max(1, min(99, no_ask))
+        sizing_prob = 100.0 - float(probability)
+
+    kelly_frac = _confidence_kelly_fraction(confidence)
     contracts = calculate_position_size(
-        sizing_prob, sizing_price, balance_cents, max_position_pct=max_position_pct,
+        sizing_prob, sizing_price, balance_cents,
+        max_position_pct=max_position_pct,
+        kelly_fraction=kelly_frac,
     )
     return {
         "side": side,
@@ -139,11 +173,12 @@ def trade_summary(
         "implied_probability": round(yes_price_cents / 100.0, 4),
         "kelly_fraction": round(kelly_criterion(sizing_prob, sizing_price), 4),
         "fractional_kelly": round(
-            fractional_kelly(sizing_prob, sizing_price), 4
+            fractional_kelly(sizing_prob, sizing_price, fraction=kelly_frac), 4
         ),
         "contracts": int(contracts),
         "should_trade": should_trade(probability, yes_price_cents, min_edge=min_edge),
         "sizing_price_cents": int(sizing_price),
+        "confidence": confidence,
     }
 
 
