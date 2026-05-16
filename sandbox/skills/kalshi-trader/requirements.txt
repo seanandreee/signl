@@ -1,0 +1,4 @@
+requests>=2.31,<3
+openai>=1.40,<2
+python-dotenv>=1.0,<2
+cryptography>=42.0,<46

@@ -1,25 +1,53 @@
-# SPDX-License-Identifier: Apache-2.0
+# OpenShell policy preset for the signl Kalshi trading bot.
 #
-# NemoClaw OpenShell preset for the signl Kalshi trading bot.
 # Apply with:
-#   nemoclaw <sandbox> policy-add --from-file ./policies/kalshi.yaml --yes
+#     openshell policy set ~/kalshi-signl/policies/kalshi.yaml
 #
-# Network access is intentionally narrow:
-#   - python3 may reach Kalshi (demo + prod), Nemotron, and Brave Search.
-#   - node may reach Telegram (OpenClaw owns Telegram I/O; Python must not
-#     call api.telegram.org directly).
-# Filesystem: only the bot's workspace is writable.
+# Allows python3 to reach exactly the endpoints signl needs:
+#   * Kalshi REST    - trading.kalshi.com, demo-api.kalshi.co (/trade-api/v2/**)
+#   * Nemotron       - integrate.api.nvidia.com  (POST chat/completions)
+#   * Brave Search   - api.search.brave.com      (news + web search)
+#   * Telegram bridge - api.telegram.org          (/bot*/**)
+#
+# Filesystem: read-write inside the workspace and a couple of cache dirs;
+# everything else is read-only or default-denied by OpenShell.
+
+version: 1
 
 preset:
-  name: kalshi-signl
-  description: "signl - Kalshi prediction market bot (Brave + Nemotron + Telegram)"
+  name: kalshi
+  description: "signl Kalshi trading bot - Kalshi + Nemotron + Brave + Telegram"
+
+filesystem_policy:
+  include_workdir: true
+  read_only:
+    - /usr
+    - /lib
+    - /proc
+    - /etc
+    - /dev/urandom
+    - /var/log
+  read_write:
+    - /tmp
+    - /dev/null
+    - /sandbox/.openclaw
+    - /sandbox/.openclaw/skills/kalshi-trader
+    - /sandbox/.nemoclaw
+
+landlock:
+  compatibility: best_effort
+
+process:
+  run_as_user: sandbox
+  run_as_group: sandbox
 
 network_policies:
-  # ── Kalshi trading API (demo + production, current + legacy hostnames) ─
+
+  # ── Kalshi REST API (demo + production hostnames) ────────────────────
   kalshi:
     name: kalshi
     endpoints:
-      - host: demo-api.kalshi.co                 # demo (legacy alias)
+      - host: demo-api.kalshi.co
         port: 443
         protocol: rest
         enforcement: enforce
@@ -27,23 +55,7 @@ network_policies:
           - allow: { method: GET,    path: "/trade-api/v2/**" }
           - allow: { method: POST,   path: "/trade-api/v2/**" }
           - allow: { method: DELETE, path: "/trade-api/v2/**" }
-      - host: external-api.demo.kalshi.co        # demo (canonical)
-        port: 443
-        protocol: rest
-        enforcement: enforce
-        rules:
-          - allow: { method: GET,    path: "/trade-api/v2/**" }
-          - allow: { method: POST,   path: "/trade-api/v2/**" }
-          - allow: { method: DELETE, path: "/trade-api/v2/**" }
-      - host: api.elections.kalshi.com           # prod (current canonical)
-        port: 443
-        protocol: rest
-        enforcement: enforce
-        rules:
-          - allow: { method: GET,    path: "/trade-api/v2/**" }
-          - allow: { method: POST,   path: "/trade-api/v2/**" }
-          - allow: { method: DELETE, path: "/trade-api/v2/**" }
-      - host: external-api.kalshi.com            # prod (legacy alias)
+      - host: trading.kalshi.com
         port: 443
         protocol: rest
         enforcement: enforce
@@ -53,10 +65,11 @@ network_policies:
           - allow: { method: DELETE, path: "/trade-api/v2/**" }
     binaries:
       - { path: /usr/bin/python3 }
+      - { path: /usr/local/bin/python3 }
 
-  # ── NVIDIA Nemotron via the OpenAI-compatible endpoint ────────────────
-  nvidia_nemotron:
-    name: nvidia_nemotron
+  # ── NVIDIA Nemotron (OpenAI-compatible) ──────────────────────────────
+  nvidia_inference:
+    name: nvidia_inference
     endpoints:
       - host: integrate.api.nvidia.com
         port: 443
@@ -64,12 +77,14 @@ network_policies:
         enforcement: enforce
         rules:
           - allow: { method: POST, path: "/v1/chat/completions" }
+          - allow: { method: POST, path: "/v1/completions" }
           - allow: { method: GET,  path: "/v1/models" }
           - allow: { method: GET,  path: "/v1/models/**" }
     binaries:
       - { path: /usr/bin/python3 }
+      - { path: /usr/local/bin/python3 }
 
-  # ── Brave Search (news headlines for sentiment.py) ────────────────────
+  # ── Brave Search (news + web fallback for sentiment.search_news) ─────
   brave_search:
     name: brave_search
     endpoints:
@@ -78,13 +93,15 @@ network_policies:
         protocol: rest
         enforcement: enforce
         rules:
+          - allow: { method: GET, path: "/res/v1/news/search" }
           - allow: { method: GET, path: "/res/v1/web/search" }
     binaries:
       - { path: /usr/bin/python3 }
+      - { path: /usr/local/bin/python3 }
 
-  # ── Telegram Bot API (node-only; OpenClaw delivers the messages) ──────
-  telegram_bot:
-    name: telegram_bot
+  # ── Telegram (OpenClaw bridge runs in node; python3 may also push) ───
+  telegram:
+    name: telegram
     endpoints:
       - host: api.telegram.org
         port: 443
@@ -97,12 +114,8 @@ network_policies:
     binaries:
       - { path: /usr/local/bin/node }
       - { path: /usr/bin/node }
+      - { path: /usr/bin/python3 }
+      - { path: /usr/local/bin/python3 }
 
-# ── Filesystem: only the bot's workspace is writable (SQLite lives here) ──
-filesystem_policy:
-  include_workdir: false
-  read_only:
-    - /home/ubuntu/kalshi-signl
-  read_write:
-    - /home/ubuntu/kalshi-signl/sandbox/workspace
-    - /tmp
+# Everything else (DNS over HTTPS, package mirrors, GitHub, etc.) is denied
+# by OpenShell's default-deny stance for any binary not listed above.
