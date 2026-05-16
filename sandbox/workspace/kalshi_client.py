@@ -57,7 +57,10 @@ def _load_private_key() -> rsa.RSAPrivateKey:
 
     Cached so we don't re-parse PEM on every request.
     """
-    path = "/home/ubuntu/kalshi-signl/kalshi-key.pem"
+    path = os.environ.get(
+        "KALSHI_PRIVATE_KEY_PATH",
+        "/home/ubuntu/kalshi-signl/kalshi-key.pem",
+    ).strip()
     if not path:
         raise KalshiError("KALSHI_PRIVATE_KEY_PATH not set")
     try:
@@ -101,7 +104,7 @@ def sign_request(method: str, path: str) -> dict[str, str]:
     ``/trade-api/v2/markets/AAPL-2026``), not just the suffix relative
     to ``BASE_URL``.
     """
-    key_id ="df7da51f-3152-4b39-9c22-fcc8cdd7063e"
+    key_id = os.environ.get("KALSHI_KEY_ID", "").strip()
     if not key_id:
         raise KalshiError("KALSHI_KEY_ID not set")
     ts = str(int(time.time() * 1000))
@@ -289,17 +292,36 @@ def get_my_positions() -> tuple[list[dict[str, Any]] | None, str | None]:
 
 
 def get_balance() -> tuple[dict[str, Any] | None, str | None]:
-    """Return the available balance for the authenticated account (in cents)."""
+    """Return the available balance for the authenticated account (in cents).
+
+    Kalshi now returns both ``balance`` (integer cents, legacy) and
+    ``balance_dollars`` (fixed-point dollar string, e.g. ``"12.3400"``).
+    We prefer ``balance_dollars`` when present and convert to cents for
+    consistency with the rest of the bot, falling back to ``balance``.
+    """
     try:
         body = _request("GET", "/portfolio/balance")
     except KalshiError as exc:
         return None, str(exc)
     if not isinstance(body, dict):
         return None, "unexpected balance response"
+    dollars = body.get("balance_dollars")
+    cents: int | None = None
+    if dollars not in (None, ""):
+        cents = _dollars_to_cents(dollars)
+    if cents is None and body.get("balance") is not None:
+        cents = int(body["balance"])
     return {
-        "balance_cents": body.get("balance"),
+        "balance_cents": cents,
+        "balance_dollars": dollars,
+        "portfolio_value": body.get("portfolio_value"),
         "payout": body.get("payout"),
     }, None
+
+
+def _cents_to_dollar_str(cents: int) -> str:
+    """Format an integer-cents price as a 4-decimal dollar string (Kalshi V2)."""
+    return f"{cents / 100:.4f}"
 
 
 def place_order(
@@ -310,10 +332,22 @@ def place_order(
     price_cents: int,
     *,
     client_order_id: str | None = None,
-    order_type: str = "limit",
-    time_in_force: str = "good_till_cancel",
+    time_in_force: str = "good_till_canceled",
+    self_trade_prevention_type: str = "taker_at_cross",
 ) -> tuple[dict[str, Any] | None, str | None]:
-    """Place a limit order. ``side`` is yes/no, ``action`` is buy/sell."""
+    """Place a limit order via the V2 ``/portfolio/events/orders`` endpoint.
+
+    The bot's public surface still speaks in ``side ∈ {yes, no}`` and
+    ``action ∈ {buy, sell}`` with integer-cent prices, which we translate
+    to V2's YES-side book quoting:
+
+    * ``buy yes  @ Nc`` -> bid at ``"0.NN00"``     (buy YES)
+    * ``sell yes @ Nc`` -> ask at ``"0.NN00"``     (sell YES)
+    * ``buy no  @ Nc`` -> ask at ``"0.{100-N}00"`` (selling YES at the complementary price)
+    * ``sell no @ Nc`` -> bid at ``"0.{100-N}00"`` (buying YES at the complementary price)
+
+    Legacy ``/portfolio/orders`` was deprecated May 6, 2026.
+    """
     ticker = ticker.strip().upper()
     side = side.strip().lower()
     action = action.strip().lower()
@@ -321,6 +355,14 @@ def place_order(
         return None, f"invalid side '{side}' (yes|no)"
     if action not in ("buy", "sell"):
         return None, f"invalid action '{action}' (buy|sell)"
+    if time_in_force not in (
+        "good_till_canceled",
+        "fill_or_kill",
+        "immediate_or_cancel",
+    ):
+        return None, f"invalid time_in_force '{time_in_force}'"
+    if self_trade_prevention_type not in ("taker_at_cross", "maker"):
+        return None, f"invalid self_trade_prevention_type '{self_trade_prevention_type}'"
     try:
         contracts = int(contracts)
         price_cents = int(price_cents)
@@ -331,53 +373,72 @@ def place_order(
     if not 1 <= price_cents <= 99:
         return None, f"price_cents {price_cents} out of range (1-99)"
 
+    # Translate (side, action) -> V2 book_side + YES-quoted price.
+    is_yes_direction = (side == "yes" and action == "buy") or (
+        side == "no" and action == "sell"
+    )
+    book_side = "bid" if is_yes_direction else "ask"
+    if side == "yes":
+        yes_price_cents = price_cents
+    else:
+        yes_price_cents = 100 - price_cents
+
     payload: dict[str, Any] = {
         "ticker": ticker,
-        "side": side,
-        "action": action,
-        "count": contracts,
-        "type": order_type,
+        "client_order_id": client_order_id or f"signl-{int(time.time() * 1000)}",
+        "side": book_side,
+        "count": f"{contracts}.00",
+        "price": _cents_to_dollar_str(yes_price_cents),
         "time_in_force": time_in_force,
-        "client_order_id": client_order_id or f"signl-{int(time.time()*1000)}",
+        "self_trade_prevention_type": self_trade_prevention_type,
     }
-    # Kalshi expects yes_price or no_price depending on side.
-    if side == "yes":
-        payload["yes_price"] = price_cents
-    else:
-        payload["no_price"] = price_cents
     try:
-        body = _request("POST", "/portfolio/orders", json_body=payload)
+        body = _request("POST", "/portfolio/events/orders", json_body=payload)
     except KalshiError as exc:
         return None, str(exc)
-    order = body.get("order") if isinstance(body, dict) else None
-    if not order:
-        return None, f"order response missing 'order': {body}"
+    if not isinstance(body, dict):
+        return None, f"unexpected order response: {body!r}"
+    fill_count = _dollars_to_cents(body.get("fill_count")) or 0
+    remaining = _dollars_to_cents(body.get("remaining_count")) or 0
+    # ``_dollars_to_cents`` multiplies by 100; counts already have ≤2 decimals,
+    # so this matches Kalshi's centicount convention exactly.
+    avg_fill = body.get("average_fill_price")
     return {
-        "order_id": order.get("order_id"),
-        "status": order.get("status"),
-        "ticker": order.get("ticker"),
-        "side": order.get("side"),
-        "action": order.get("action"),
-        "count": order.get("count"),
-        "yes_price": order.get("yes_price"),
-        "no_price": order.get("no_price"),
+        "order_id": body.get("order_id"),
+        "client_order_id": body.get("client_order_id"),
+        "ticker": ticker,
+        "requested_side": side,
+        "requested_action": action,
+        "requested_contracts": contracts,
+        "requested_price_cents": price_cents,
+        "book_side": book_side,
+        "yes_price_cents_sent": yes_price_cents,
+        "fill_centicount": fill_count,
+        "remaining_centicount": remaining,
+        "average_fill_price_dollars": avg_fill,
+        "ts_ms": body.get("ts_ms"),
+        "status": "filled" if remaining == 0 and fill_count > 0 else "resting",
     }, None
 
 
 def cancel_order(order_id: str) -> tuple[dict[str, Any] | None, str | None]:
-    """Cancel an open order by id."""
+    """Cancel an open order by id (V2 ``/portfolio/events/orders/{id}``)."""
     order_id = (order_id or "").strip()
     if not order_id:
         return None, "order_id is required"
     try:
-        body = _request("DELETE", f"/portfolio/orders/{order_id}")
+        body = _request("DELETE", f"/portfolio/events/orders/{order_id}")
     except KalshiError as exc:
         return None, str(exc)
     return body if isinstance(body, dict) else {"raw": body}, None
 
 
 def get_order_status(order_id: str) -> tuple[dict[str, Any] | None, str | None]:
-    """Fetch the latest status of an order."""
+    """Fetch the latest status of an order.
+
+    Read endpoint; the legacy path is still the canonical one for single-order
+    reads as of 2026-05.
+    """
     order_id = (order_id or "").strip()
     if not order_id:
         return None, "order_id is required"
@@ -415,21 +476,62 @@ def get_market_history(
 # ---------------------------------------------------------------------------
 
 
+def _dollars_to_cents(value: Any) -> int | None:
+    """Convert a Kalshi *_dollars field (str like "0.0800" or float) to int cents.
+
+    Kalshi production migrated read endpoints to dollar-denominated strings
+    (e.g. ``yes_ask_dollars: "0.0800"``). The rest of the bot still works in
+    integer cents 1-99, so we round to the nearest cent on the way in.
+    Returns ``None`` for missing/empty/unparseable values.
+    """
+    if value is None or value == "":
+        return None
+    try:
+        return int(round(float(value) * 100))
+    except (TypeError, ValueError):
+        return None
+
+
+def _first_present(m: dict[str, Any], *keys: str) -> Any:
+    """Return the first key in ``m`` that has a non-None, non-empty value."""
+    for k in keys:
+        v = m.get(k)
+        if v not in (None, ""):
+            return v
+    return None
+
+
 def _normalise_market(m: dict[str, Any]) -> dict[str, Any]:
-    """Pluck the fields the rest of the bot relies on into a stable shape."""
+    """Pluck the fields the rest of the bot relies on into a stable shape.
+
+    Handles both Kalshi's current ``*_dollars`` / ``*_fp`` schema and the
+    legacy integer-cents schema, normalising everything to integer cents for
+    prices and integer counts for volume / open interest.
+    """
+    yes_ask_d = _first_present(m, "yes_ask_dollars")
+    yes_bid_d = _first_present(m, "yes_bid_dollars")
+    no_ask_d = _first_present(m, "no_ask_dollars")
+    no_bid_d = _first_present(m, "no_bid_dollars")
+    last_d = _first_present(m, "last_price_dollars")
+    vol_fp = _first_present(m, "volume_fp", "volume")
+    vol24_fp = _first_present(m, "volume_24h_fp", "volume_24h")
+    oi_fp = _first_present(m, "open_interest_fp", "open_interest")
+
     return {
         "ticker": m.get("ticker"),
         "title": m.get("title") or m.get("subtitle"),
-        "yes_bid": m.get("yes_bid"),
-        "yes_ask": m.get("yes_ask"),
-        "no_bid": m.get("no_bid"),
-        "no_ask": m.get("no_ask"),
-        "last_price": m.get("last_price"),
-        "volume": m.get("volume"),
-        "volume_24h": m.get("volume_24h"),
-        "open_interest": m.get("open_interest"),
+        "yes_bid": _dollars_to_cents(yes_bid_d) if yes_bid_d is not None else m.get("yes_bid"),
+        "yes_ask": _dollars_to_cents(yes_ask_d) if yes_ask_d is not None else m.get("yes_ask"),
+        "no_bid": _dollars_to_cents(no_bid_d) if no_bid_d is not None else m.get("no_bid"),
+        "no_ask": _dollars_to_cents(no_ask_d) if no_ask_d is not None else m.get("no_ask"),
+        "last_price": _dollars_to_cents(last_d) if last_d is not None else m.get("last_price"),
+        "volume": int(float(vol_fp)) if vol_fp is not None else None,
+        "volume_24h": int(float(vol24_fp)) if vol24_fp is not None else None,
+        "open_interest": int(float(oi_fp)) if oi_fp is not None else None,
         "close_time": m.get("close_time"),
         "status": m.get("status"),
         "category": m.get("category"),
         "subtitle": m.get("subtitle"),
+        "event_ticker": m.get("event_ticker"),
+        "market_type": m.get("market_type"),
     }
